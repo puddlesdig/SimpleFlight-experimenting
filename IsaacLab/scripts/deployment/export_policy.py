@@ -1,20 +1,52 @@
 #!/usr/bin/env python3
-"""Export trained policy to a standalone PyTorch model for deployment."""
+"""Export RSL-RL trained policy to standalone deployment format.
+
+This converts an RSL-RL checkpoint (ActorCritic) to the standalone
+SimpleActorNetwork format used by deploy_standalone.py.
+"""
 
 import argparse
 import torch
+import torch.nn as nn
 from pathlib import Path
 
-# Add IsaacLab paths
-import sys
-isaaclab_path = Path(__file__).resolve().parents[2]
-sys.path.append(str(isaaclab_path / "source" / "extensions" / "isaaclab.rl.rsl_rl"))
 
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, OnPolicyRunner
+class SimpleActorNetwork(nn.Module):
+    """Standalone actor network matching deployment format."""
+    
+    def __init__(self, obs_dim=42, action_dim=4, hidden_dims=[256, 256, 256]):
+        super().__init__()
+        
+        # Observation normalization
+        self.obs_norm = nn.Sequential(
+            nn.LayerNorm(obs_dim, elementwise_affine=True),
+        )
+        
+        # MLP encoder
+        layers = []
+        in_dim = obs_dim
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(in_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ELU(),
+            ])
+            in_dim = hidden_dim
+        self.encoder = nn.Sequential(*layers)
+        
+        # Action head
+        self.action_mean = nn.Linear(hidden_dims[-1], action_dim)
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
+    
+    def forward(self, obs):
+        normalized_obs = self.obs_norm(obs)
+        features = self.encoder(normalized_obs)
+        action_mean = self.action_mean(features)
+        return action_mean
 
 
-def export_policy(checkpoint_path: str, output_path: str):
-    """Export the actor network from a trained checkpoint.
+def export_policy(checkpoint_path, output_path):
+    """Export actor network from RSL-RL checkpoint.
     
     Args:
         checkpoint_path: Path to the training checkpoint (.pt file)

@@ -16,7 +16,9 @@ from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
 from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
 
-logging.basicConfig(level=logging.INFO)
+# Set logging level based on environment variable or default to INFO
+log_level = logging.DEBUG if "--debug" in __import__('sys').argv else logging.INFO
+logging.basicConfig(level=log_level, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 
@@ -166,32 +168,82 @@ class SimpleFlightDeployer:
         obs_tensor = torch.from_numpy(obs).float().unsqueeze(0)
         
         with torch.no_grad():
-            action_tensor = self.actor(obs_tensor)
-            action = torch.tanh(action_tensor)  # Squash to [-1, 1]
+            action_raw = self.actor(obs_tensor)
+            action = torch.tanh(action_raw)  # Squash to [-1, 1]
+        
+        # LAYER 1: Policy Output Sanity Check
+        logger.debug(f"[LAYER 1] Policy raw output: {action_raw.squeeze().numpy()}")
+        logger.debug(f"[LAYER 1] Policy tanh output: {action.squeeze().numpy()}")
+        
+        # Check for NaN/Inf
+        if torch.isnan(action).any() or torch.isinf(action).any():
+            logger.error(f"[LAYER 1] FAILURE: NaN/Inf detected in action! raw={action_raw}, tanh={action}")
+        
+        # Check if all zeros (dead network)
+        if torch.all(action == 0):
+            logger.warning(f"[LAYER 1] WARNING: All-zero action output (dead network?)")
         
         return action.squeeze(0).numpy()
     
-    def send_ctbr_command(self, scf, action):
-        """Send CTBR command."""
-        rpy_scale = 30  # deg/s (reduced for safety)
+    def send_ctbr_command(self, scf, action, thrust_offset=0.4, thrust_scale=1.0):
+        """Send CTBR command matching SimpleFlight's cmdVel format.
         
-        # Force minimum thrust for testing
-        min_thrust = 35000  # ~53% thrust - enough to feel motors
-        max_thrust = 45000  # ~68% thrust - safe for hand test
+        Args:
+            scf: SyncCrazyflie object
+            action: Policy action [roll, pitch, yaw, thrust] in [-1, 1]
+            thrust_offset: Thrust offset for calibration (default: 0.4)
+            thrust_scale: Thrust scaling factor (default: 1.0)
+        """
+        # SimpleFlight's format from drone_swarm.py:
+        # cf.cmdVel(action[0] * rpy_scale, -action[1] * rpy_scale, -action[2] * rpy_scale, thrust*2**16)
+        # where action is tanh-squashed [-1, 1] and thrust = (action[3] + 1) / 2
         
+        rpy_scale = 30.0  # deg/s (SimpleFlight uses 30 for real deployment)
+        
+        # LAYER 2: Action Normalization Check
+        logger.debug(f"[LAYER 2] Raw action from policy: {action}")
+        if not np.all((action >= -1.0) & (action <= 1.0)):
+            logger.error(f"[LAYER 2] FAILURE: Action outside [-1,1] range: {action}")
+        
+        # Convert action to RPYT
         roll_rate = float(action[0] * rpy_scale)
-        pitch_rate = float(action[1] * rpy_scale)
-        yaw_rate = float(action[2] * rpy_scale)
+        pitch_rate = float(-action[1] * rpy_scale)  # Note the negation!
+        yaw_rate = float(-action[2] * rpy_scale)    # Note the negation!
         
-        # Remap action[-1,1] to thrust range
-        thrust_normalized = (action[3] + 1) / 2  # [0, 1]
-        thrust = min_thrust + thrust_normalized * (max_thrust - min_thrust)
-        thrust_uint16 = int(np.clip(thrust, min_thrust, max_thrust))
+        # Thrust with calibration
+        thrust_normalized = (action[3] + 1) / 2  # [-1,1] -> [0,1]
+        thrust_scaled = (thrust_normalized + thrust_offset) * thrust_scale
+        thrust_scaled = max(0.0, min(1.0, thrust_scaled))  # Clamp to [0, 1]
         
-        scf.cf.commander.send_setpoint(roll_rate, pitch_rate, yaw_rate, thrust_uint16)
+        thrust = int(thrust_scaled * 65535)
+        
+        # LAYER 3: Command Mapping Check
+        logger.debug(f"[LAYER 3] Mapped RPYT: roll={roll_rate:.1f}, pitch={pitch_rate:.1f}, yaw={yaw_rate:.1f}, thrust={thrust}")
+        logger.debug(f"[LAYER 3] Thrust calc: action[3]={action[3]:.3f} → norm={thrust_normalized:.3f} → +offset={thrust_normalized+thrust_offset:.3f} → final={thrust}")
+        
+        if thrust == 0:
+            logger.warning(f"[LAYER 3] WARNING: Thrust mapped to ZERO! Check offset/action.")
+        if thrust < 20000:
+            logger.warning(f"[LAYER 3] WARNING: Thrust {thrust} below motor threshold (~20000)")
+        
+        # LAYER 4: Radio Transport
+        try:
+            # Send RPYT setpoint
+            scf.cf.commander.send_setpoint(roll_rate, pitch_rate, yaw_rate, thrust)
+            logger.debug(f"[LAYER 4] send_setpoint() called successfully")
+        except Exception as e:
+            logger.error(f"[LAYER 4] FAILURE: send_setpoint() raised exception: {e}")
+            raise
     
-    def run(self, duration_s=10.0, control_rate_hz=100.0):
-        """Run policy control loop."""
+    def run(self, duration_s=10.0, control_rate_hz=100.0, thrust_offset=0.4, thrust_scale=1.0):
+        """Run policy control loop.
+        
+        Args:
+            duration_s: Flight duration in seconds
+            control_rate_hz: Control loop frequency in Hz
+            thrust_offset: Thrust offset for calibration
+            thrust_scale: Thrust scaling factor
+        """
         cflib.crtp.init_drivers()
         
         logger.info(f"Connecting to {self.uri}")
@@ -229,7 +281,35 @@ class SimpleFlightDeployer:
             scf.cf.param.set_value('commander.enHighLevel', '0')
             time.sleep(0.1)
             
+            # LAYER 5: Commander State Validation
+            logger.info("[LAYER 5] Verifying commander configuration...")
+            try:
+                # Read back the parameter to confirm it was set
+                enHighLevel = scf.cf.param.get_value('commander.enHighLevel')
+                logger.info(f"[LAYER 5] commander.enHighLevel = {enHighLevel} (expected: 0)")
+                
+                if enHighLevel != '0':
+                    logger.error(f"[LAYER 5] FAILURE: High-level commander still enabled!")
+            except Exception as e:
+                logger.warning(f"[LAYER 5] Could not read commander.enHighLevel: {e}")
+            
+            # LAYER 6: Safety/Arming State
+            logger.info("[LAYER 6] Checking safety and estimator state...")
+            try:
+                # Check if estimator is ready
+                isFlying = scf.cf.param.get_value('supervisor.isFlying')
+                canFly = scf.cf.param.get_value('supervisor.canFly')
+                logger.info(f"[LAYER 6] supervisor.isFlying = {isFlying}")
+                logger.info(f"[LAYER 6] supervisor.canFly = {canFly}")
+                
+                if canFly != '1':
+                    logger.warning(f"[LAYER 6] WARNING: supervisor.canFly is not 1 - drone may reject commands")
+            except Exception as e:
+                logger.warning(f"[LAYER 6] Could not read supervisor params: {e}")
+            
+            logger.info("")
             logger.info(f"Starting policy control for {duration_s}s at {control_rate_hz}Hz")
+            logger.info(f"Thrust calibration: offset={thrust_offset}, scale={thrust_scale}")
             logger.info(f"Hover target: {self.origin}")
             logger.info(f"Initial position: {self.position}")
             logger.info("")
@@ -238,19 +318,41 @@ class SimpleFlightDeployer:
             logger.info("=" * 60)
             logger.info("")
             
+            # LAYER 7: Timing Verification
             dt = 1.0 / control_rate_hz
             num_steps = int(duration_s / dt)
+            loop_times = []
+            
+            logger.info(f"[LAYER 7] Target loop time: {dt*1000:.1f}ms ({control_rate_hz}Hz)")
             
             try:
                 for step in range(num_steps):
+                    loop_start = time.time()
+                    
                     obs = self.get_observation()
                     action = self.policy_inference(obs)
-                    self.send_ctbr_command(scf, action)
+                    self.send_ctbr_command(scf, action, thrust_offset, thrust_scale)
+                    
+                    loop_end = time.time()
+                    loop_time = loop_end - loop_start
+                    loop_times.append(loop_time)
+                    
+                    # LAYER 7: Timing check
+                    if loop_time > dt:
+                        logger.warning(f"[LAYER 7] Loop time {loop_time*1000:.1f}ms exceeds target {dt*1000:.1f}ms - watchdog may timeout!")
                     
                     if step % int(0.1 / dt) == 0:
-                        logger.info(f"Pos: {self.position}, Vel: {self.velocity}, Action: {action}")
+                        thrust_norm = (action[3] + 1) / 2
+                        thrust_final = (thrust_norm + thrust_offset) * thrust_scale
+                        thrust_uint = int(np.clip(thrust_final * 65535, 0, 65535))
+                        avg_loop = np.mean(loop_times[-10:]) * 1000 if loop_times else 0
+                        logger.info(
+                            f"t={step*dt:.1f}s | Pos: [{self.position[0]:.2f}, {self.position[1]:.2f}, {self.position[2]:.2f}] | "
+                            f"Action: r={action[0]:.2f}, p={action[1]:.2f}, y={action[2]:.2f}, t={action[3]:.2f}→{thrust_uint} | "
+                            f"Loop: {avg_loop:.1f}ms"
+                        )
                     
-                    time.sleep(dt)
+                    time.sleep(max(0, dt - loop_time))  # Compensate for processing time
                     
             except KeyboardInterrupt:
                 logger.warning("\n🛑 EMERGENCY STOP - Ctrl+C pressed!")
@@ -278,11 +380,22 @@ def main():
                        help="Flight duration in seconds")
     parser.add_argument("--rate", type=float, default=100.0,
                        help="Control rate in Hz")
+    parser.add_argument("--thrust-offset", type=float, default=0.4,
+                       help="Thrust offset for sim-to-real calibration (default: 0.4)")
+    parser.add_argument("--thrust-scale", type=float, default=1.0,
+                       help="Thrust scaling factor (default: 1.0)")
+    parser.add_argument("--debug", action='store_true',
+                       help="Enable DEBUG level logging for detailed diagnostics")
     
     args = parser.parse_args()
     
     deployer = SimpleFlightDeployer(uri=args.uri, actor_path=args.actor)
-    deployer.run(duration_s=args.duration, control_rate_hz=args.rate)
+    deployer.run(
+        duration_s=args.duration,
+        control_rate_hz=args.rate,
+        thrust_offset=args.thrust_offset,
+        thrust_scale=args.thrust_scale
+    )
 
 
 if __name__ == "__main__":
